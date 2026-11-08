@@ -49,3 +49,14 @@ final class CuaComputerUseSessions: ComputerUseSessionControlling {
         }
     }
 }
+
+extension CuaComputerUseSessions {
+    /// The App's sessions over the running helper (`ComputerUseHelperDaemon.shared`): what the File menu's
+    /// Computer Use actions and a sidebar row's drive indicator stop through.
+    static func app(services: AppServices) -> CuaComputerUseSessions {
+        let helper = ComputerUseHelperDaemon.shared
+        return CuaComputerUseSessions(configuration: { helper.configuration },
+                                      phase: { [weak services] in services?.onboarding.computerUseSetup.phase ?? .off },
+                                      confirmRunning: { helper.confirmRunning() })
+    }
+}
