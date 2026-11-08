@@ -1257,7 +1257,11 @@ fn parse_terminal(
             if flags.boolean("unwrap") {
                 params.insert("unwrap".into(), Value::Bool(true));
             }
+            // Plain text, as `screen read` prints it, unless --details asks
+            // for the record's fields (W5-R, bench round 4 item 10).
+            let details = flags.boolean("details");
             request(ResourceOperation::TerminalCopy, selectors, flags, params)
+                .map(|plan| if details { plan } else { plan.screen_text() })
         }
         [selector, "process", "show"] => {
             selectors.insert("terminal", "term", selector)?;
