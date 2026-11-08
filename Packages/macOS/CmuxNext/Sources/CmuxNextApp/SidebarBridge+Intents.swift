@@ -1,5 +1,6 @@
 import CmuxNextActions
 import CmuxNextBridge
+import CmuxNextComputerUse
 import CmuxNextDaemon
 import CmuxNextSettings
 import CmuxNextSidebar
@@ -51,6 +52,7 @@ extension SidebarBridge {
             // A pick in this window's sidebar shows here, also a workspace another window lists.
             services.windows.show(workspaceID: id.rawValue, in: state, from: .thisWindow)
         case let .selectTab(_, tab): revealPinnedTab(tab.rawValue) // shown in this window (cmux#37371)
+        case let .stopAgentDrive(_, tab, drive): stopAgentDrive(tab: tab.rawValue, drive: drive)
         // The tab strip's close for that tab, on whichever machine holds it (the palette's Close Tab).
         case let .closeTab(_, tab): PaletteSourcesBridge.TabSource(services: services).closeTab(id: tab.rawValue)
         case .reorder(let ids, let position):
@@ -218,6 +220,28 @@ extension SidebarBridge {
         Task { [services] in
             let failure = if let send { await send() } else { await daemon.failure(label, body) }
             if let failure { withExtendedLifetime(services) { failed(failure) } }
+        }
+    }
+}
+
+extension SidebarBridge {
+    /// The drive indicator's Stop: the agent's Computer Use session, or its chat's turn (a terminal agent's
+    /// browser use offers no Stop, `SidebarPresence.canStop`). A refusal (no live session, the host
+    /// down) reaches the person as the File menu's Stop Computer Use's does.
+    func stopAgentDrive(tab id: String, drive: SidebarDriveKind) {
+        guard let tab = services.machines.daemons.lazy.compactMap({ $0.store.tab(id: id) }).first else { return }
+        switch drive {
+        case .browser:
+            services.agentTabs.existingView(id)?.stopTurn()
+        case .screen:
+            let stop = AgentDriveStop(sessions: CuaComputerUseSessions.app(services: services)), registry = services.registry
+            let terminals = Set([tab.terminalID?.rawValue, tab.terminalResourceID?.rawValue].compactMap(\.self))
+            // main-hop-allow: the person's click; one CUA host request with a 5 s deadline, no frame work.
+            Task { @MainActor in
+                do {
+                    if try await stop.stopScreen(terminals: terminals) == nil { registry.refuse(ComputerUseSessionStrings.noLiveSession) }
+                } catch { registry.refuse((error as? ComputerUseSessionError)?.reason ?? String(describing: error)) }
+            }
         }
     }
 }
