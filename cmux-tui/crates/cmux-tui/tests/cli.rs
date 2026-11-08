@@ -3832,6 +3832,9 @@ mod status;
 #[path = "cli/tab_group_hex.rs"]
 mod tab_group_hex;
 #[cfg(unix)]
+#[path = "cli/terminal_copy_text.rs"]
+mod terminal_copy_text;
+#[cfg(unix)]
 #[path = "cli/terminal_paste.rs"]
 mod terminal_paste;
 #[cfg(unix)]
