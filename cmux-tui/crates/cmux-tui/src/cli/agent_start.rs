@@ -380,6 +380,18 @@ pub(in crate::cli) fn apply_outcome(report: &mut Value, outcome: &Outcome, who: 
                  cmux terminal {who} resume brings it back"
             )),
         ),
+        Some(Readiness::Starting) | None if outcome.report_required => (
+            "timeout",
+            TIMEOUT_EXIT,
+            None,
+            Some(
+                crate::localization::catalog()
+                    .terminal_input
+                    .resume_not_reported
+                    .replace("{waited}", &waited)
+                    .replace("{who}", who),
+            ),
+        ),
         Some(Readiness::Starting) | None => (
             "timeout",
             TIMEOUT_EXIT,
@@ -401,7 +413,8 @@ fn humantime(duration: Duration) -> String {
     super::terminal_talk::roster::age(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Waits (unless `--no-wait`) and records the end in `report`.
+/// Waits (unless `--no-wait`) and records the end in `report`. A resume
+/// (`report_required`) is ready only once the agent itself reports idle.
 fn finish<D: Daemon + ?Sized>(
     daemon: &D,
     clock: &mut Clock<'_>,
@@ -409,6 +422,7 @@ fn finish<D: Daemon + ?Sized>(
     created: &Created,
     who: &str,
     report: &mut Value,
+    report_required: bool,
 ) -> Result<i32, Failure> {
     if options.focus
         && let Ok(focus) = plan(&["tab", created.tab.as_str(), "focus"])
@@ -421,7 +435,7 @@ fn finish<D: Daemon + ?Sized>(
         return Ok(0);
     }
     let reads = terminal_reads(&created.terminal)?;
-    let wait = WaitOptions::new(options.timeout, clock.now_ms);
+    let wait = WaitOptions { report_required, ..WaitOptions::new(options.timeout, clock.now_ms) };
     let outcome = readiness::wait(daemon, &reads, wait, clock.now, clock.sleep)?;
     Ok(apply_outcome(report, &outcome, who))
 }
@@ -501,7 +515,7 @@ pub(in crate::cli) fn start<D: Daemon + ?Sized>(
     }
     let mut report =
         report(Some(name), &launch, harness.as_deref(), cwd.as_deref(), &placement, &created);
-    let exit = finish(daemon, clock, options, &created, name, &mut report)?;
+    let exit = finish(daemon, clock, options, &created, name, &mut report, false)?;
     Ok((report, exit))
 }
 
@@ -737,7 +751,9 @@ pub(in crate::cli) fn resume<D: Daemon + ?Sized>(
         }),
     );
     let who = name.unwrap_or(created.terminal.as_str()).to_owned();
-    let exit = finish(daemon, clock, options, &created, &who, &mut report)?;
+    // The session id came from the agent's hooks, so they report this agent:
+    // a resumed Claude Code draws its input box before it takes a message.
+    let exit = finish(daemon, clock, options, &created, &who, &mut report, true)?;
     Ok((report, exit))
 }
 
