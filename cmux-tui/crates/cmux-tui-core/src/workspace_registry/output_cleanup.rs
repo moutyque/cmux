@@ -21,12 +21,19 @@
 //!   registry. The old file stays as `workspace-registry.sqlite3.pre-output-
 //!   cleanup` until the next start that opens the new registry.
 //!
+//! The same pass drops the `personal.session.put` records a later put of
+//! the same session superseded ([`session_puts`] says which and why no
+//! reader needs them): a loop that re-put one session every few
+//! milliseconds left 11.5M of them in one registry. The pack records their
+//! runs in `journal_pruned_ranges` like removed output.
+//!
 //! Sequences never change: cursors, checkpoints and hook deliveries keep
 //! pointing at the same records. The journal readers accept a missing run of
 //! sequences exactly when one pruned range covers it ([`pruned_gap`]).
 //!
 //! Both phases copy every kept record, and Phase B does it inside the open.
-//! That is cheap only while output is most of the journal; a registry whose
+//! That is cheap only while output and superseded puts are most of the
+//! journal; a registry whose
 //! journal is mostly other records (one held 12M rows, 96.6% of them session
 //! records) staged 38 GB and would have spent hours of a start copying it. So
 //! the cleanup runs only while the kept records stay under
@@ -39,6 +46,7 @@
 mod chunks;
 mod codec;
 mod pruned;
+mod session_puts;
 mod stage;
 mod swap;
 
@@ -172,14 +180,17 @@ fn copied_bytes(source: &Connection) -> anyhow::Result<u64> {
 
 /// `Some(reason)` when a cleanup that keeps `kept` of `total` journal
 /// records would copy too much: over [`MAX_KEPT_RECORDS`], or over half of
-/// the journal (output is not what fills it).
+/// the journal (output and superseded puts are not what fills it).
 fn kept_refusal(kept: u64, total: u64) -> Option<String> {
     if kept > MAX_KEPT_RECORDS {
         Some(format!(
             "{kept} of {total} journal records would be kept, over the bound of {MAX_KEPT_RECORDS}"
         ))
     } else if kept.saturating_mul(2) > total {
-        Some(format!("{kept} of {total} journal records are not terminal output"))
+        Some(format!(
+            "{kept} of {total} journal records are neither terminal output nor superseded \
+             session puts"
+        ))
     } else {
         None
     }
@@ -207,11 +218,16 @@ fn staged_bytes_over(staging: &Connection, limit: u64) -> anyhow::Result<Option<
     }))
 }
 
-/// (non-output, all) live journal rows after the sealed segments. The
-/// non-output count (two index ranges on either side of the output kind)
-/// stops one past [`MAX_KEPT_RECORDS`], so it reads at most that many index
-/// entries; the total is the sequence range (two index seeks).
-fn live_records(source: &Connection) -> anyhow::Result<(u64, u64)> {
+/// (kept, all) live journal rows after the sealed segments. The kept count
+/// (index ranges on either side of the output and session put kinds) stops
+/// one past [`MAX_KEPT_RECORDS`], so it reads at most that many index
+/// entries; the total is the sequence range (two index seeks). Session puts
+/// count with `puts`: the ones its read kept, and every live put after its
+/// bound. Without it (before the read) no put counts.
+fn live_records(
+    source: &Connection,
+    puts: Option<&session_puts::SessionPuts>,
+) -> anyhow::Result<(u64, u64)> {
     let archive_end: i64 = source.query_row(
         "SELECT COALESCE(MAX(end_sequence), 0) FROM journal_segments",
         [],
@@ -222,8 +238,13 @@ fn live_records(source: &Connection) -> anyhow::Result<(u64, u64)> {
         [archive_end],
         |row| row.get(0),
     )?;
+    // `personal.session.put` sorts before `terminal.output`. Every range
+    // names ?4 and ?1 binds by index, so an unused one is fine.
     let mut kept = 0_u64;
-    for range in ["kind < ?1", "kind > ?1"] {
+    let ranges = ["kind < ?4", "kind > ?4 AND kind < ?1", "kind > ?1 AND kind > ?4"];
+    let put_range = format!("kind = ?4 AND sequence > {}", puts.map_or(0, |puts| puts.bound()));
+    let ranges = ranges.iter().copied().chain(puts.map(|_| put_range.as_str()));
+    for range in ranges {
         let limit = i64::try_from((MAX_KEPT_RECORDS + 1).saturating_sub(kept))?;
         let rows: i64 = source.query_row(
             &format!(
@@ -231,10 +252,13 @@ fn live_records(source: &Connection) -> anyhow::Result<(u64, u64)> {
                    SELECT 1 FROM session_journal INDEXED BY session_journal_by_kind_sequence
                    WHERE {range} AND sequence > ?2 LIMIT ?3)"
             ),
-            params![OUTPUT_KIND, archive_end, limit],
+            params![OUTPUT_KIND, archive_end, limit, session_puts::SESSION_PUT_KIND],
             |row| row.get(0),
         )?;
         kept = kept.saturating_add(u64::try_from(rows)?);
+    }
+    if let Some(puts) = puts {
+        kept = kept.saturating_add(puts.live_kept());
     }
     Ok((kept, u64::try_from((head - archive_end).max(0))?))
 }

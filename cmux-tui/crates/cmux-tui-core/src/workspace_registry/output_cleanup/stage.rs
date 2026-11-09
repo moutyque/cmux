@@ -17,6 +17,10 @@ use super::super::{
 };
 use super::chunks::{CHUNK_SCHEMA, StagedRecord, insert_chunk};
 use super::codec::{inflate_segment, split_records};
+use super::session_puts::{
+    SESSION_PUT_KIND, SESSION_PUTS_SCHEMA, SESSION_PUTS_STATE, SessionPuts, record_live_puts,
+    release_held_puts,
+};
 use super::{
     MAX_KEPT_RECORDS, OUTPUT_KIND, copied_bytes, free_space_refusal, kept_refusal, live_records,
     remove_staging, staged_bytes_refusal, staging_path,
@@ -24,8 +28,10 @@ use super::{
 use crate::platform;
 
 /// Format 3 stores kept records compressed (`chunks.rs`); a format 2 file
-/// (plain JSON per record) is discarded and staged again.
-const STAGING_FORMAT: &str = "3";
+/// (plain JSON per record) is discarded and staged again. Format 4 drops
+/// superseded session puts (`session_puts.rs`): a format 3 file kept them
+/// all, so it is staged again.
+const STAGING_FORMAT: &str = "4";
 /// Free space is checked again after this many staged segments.
 const SEGMENTS_PER_SPACE_CHECK: u64 = 256;
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -106,7 +112,9 @@ fn stage_registry_until_stopped(
     // A mixed segment counts as output here (the staged count checks it as
     // it goes), but every record counts toward the journal's size.
     let sealed = sealed_records(&source, 0)?;
-    let (live_kept, live_total) = live_records(&source)?;
+    // Before the live puts are read, none counts as kept: the staged counts
+    // check the real number as staging goes.
+    let (live_kept, live_total) = live_records(&source, None)?;
     if let Some(reason) = kept_refusal(sealed.kept_at_least + live_kept, sealed.total + live_total)
     {
         remove_staging(db_path)?;
@@ -125,6 +133,8 @@ fn stage_registry_until_stopped(
             kept: kept_records(&staging)?,
         });
     }
+    // Before any segment is staged: the latest live put of each session.
+    record_live_puts(&source, &staging)?;
     let staged_through = state_u64(&staging, "staged_through")?;
     if staged_through > 0 {
         eprintln!(
@@ -140,8 +150,10 @@ fn stage_registry_until_stopped(
             Staged::Refused(reason) => return Ok(StageOutcome::Refused(reason)),
             Staged::Abandoned(reason) => Some(reason),
             Staged::Finished => {
+                release_held_puts(&staging)?;
                 let (staged_kept, staged_total) = staged_records(&staging)?;
-                let (live_kept, live_total) = live_records(&source)?;
+                let puts = SessionPuts::load(&staging)?;
+                let (live_kept, live_total) = live_records(&source, Some(&puts))?;
                 staged_bytes_refusal(&staging)?
                     .or_else(|| kept_refusal(staged_kept + live_kept, staged_total + live_total))
             }
@@ -186,7 +198,8 @@ pub(super) fn output_present(source: &Connection) -> anyhow::Result<bool> {
 /// The records of the sealed segments after sequence `after`, from their
 /// kind map alone (a row of each segment, never its content).
 pub(super) struct SealedRecords {
-    /// Records of segments without output: kept for certain.
+    /// Records of segments without output or session puts: kept for certain
+    /// (superseded puts are dropped, and the map does not say how many).
     pub(super) kept_at_least: u64,
     /// Records of every segment that is not output only (mixed and unmapped
     /// segments too): at most this many are kept.
@@ -197,7 +210,8 @@ pub(super) struct SealedRecords {
 
 pub(super) fn sealed_records(source: &Connection, after: u64) -> anyhow::Result<SealedRecords> {
     let (at_least, at_most, total): (i64, i64, i64) = source.query_row(
-        "SELECT COALESCE(SUM(CASE WHEN has_other AND NOT has_output THEN record_count END), 0),
+        "SELECT COALESCE(SUM(CASE WHEN has_other AND NOT has_output AND NOT has_put
+                                  THEN record_count END), 0),
                 COALESCE(SUM(CASE WHEN has_other OR NOT has_output THEN record_count END), 0),
                 COALESCE(SUM(record_count), 0)
          FROM (
@@ -206,11 +220,14 @@ pub(super) fn sealed_records(source: &Connection, after: u64) -> anyhow::Result<
                          WHERE kinds.segment_id = segment.segment_id AND kinds.kind = ?1)
                     AS has_output,
                   EXISTS(SELECT 1 FROM journal_segment_kinds AS kinds
+                         WHERE kinds.segment_id = segment.segment_id AND kinds.kind = ?3)
+                    AS has_put,
+                  EXISTS(SELECT 1 FROM journal_segment_kinds AS kinds
                          WHERE kinds.segment_id = segment.segment_id AND kinds.kind != ?1)
                     AS has_other
            FROM journal_segments AS segment
            WHERE segment.start_sequence > ?2)",
-        params![OUTPUT_KIND, i64::try_from(after)?],
+        params![OUTPUT_KIND, i64::try_from(after)?, SESSION_PUT_KIND],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     Ok(SealedRecords {
@@ -269,8 +286,9 @@ pub(super) fn open_staging(db_path: &Path, registry_id: &str) -> anyhow::Result<
          );",
     )?;
     connection.execute_batch(CHUNK_SCHEMA)?;
+    connection.execute_batch(SESSION_PUTS_SCHEMA)?;
     let tx = connection.unchecked_transaction()?;
-    for (key, value) in [
+    for (key, value) in SESSION_PUTS_STATE.into_iter().chain([
         ("format", STAGING_FORMAT),
         ("registry_id", registry_id),
         ("staged_through", "0"),
@@ -280,7 +298,7 @@ pub(super) fn open_staging(db_path: &Path, registry_id: &str) -> anyhow::Result<
         ("live_archive_end", "0"),
         ("live_head", "0"),
         ("live_output", "0"),
-    ] {
+    ]) {
         tx.execute("INSERT INTO output_cleanup_state(key, value) VALUES(?1, ?2)", [key, value])?;
     }
     tx.commit()?;
@@ -344,6 +362,7 @@ pub(super) fn stage_segments(
 ) -> anyhow::Result<Staged> {
     let total: i64 =
         source.query_row("SELECT COUNT(*) FROM journal_segments", [], |row| row.get(0))?;
+    let mut puts = SessionPuts::load(staging)?;
     let mut since_space_check = 0_u64;
     let mut last_log = Instant::now();
     loop {
@@ -378,6 +397,8 @@ pub(super) fn stage_segments(
             "journal segments contain a gap before sequence {start}"
         );
         let kept = kept_segment_records(source, &segment_id, start, end, record_count)?;
+        let split = puts.split_segment(kept, start);
+        let kept_count = i64::try_from(split.staged.len())? + i64::try_from(split.held)?;
         let tx = staging.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO output_cleanup_segments(
@@ -387,11 +408,12 @@ pub(super) fn stage_segments(
                 i64::try_from(start)?,
                 i64::try_from(end)?,
                 record_count,
-                i64::try_from(kept.len())?,
-                record_count - i64::try_from(kept.len())?
+                kept_count,
+                record_count - kept_count
             ],
         )?;
-        insert_chunk(&tx, &kept)?;
+        insert_chunk(&tx, &split.staged)?;
+        puts.record_split(&tx, &split)?;
         tx.execute(
             "UPDATE output_cleanup_state SET value = ?1 WHERE key = 'staged_through'",
             [end.to_string()],

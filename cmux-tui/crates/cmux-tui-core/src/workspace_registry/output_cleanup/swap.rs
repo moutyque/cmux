@@ -23,6 +23,7 @@ use super::super::{
 };
 use super::chunks::{CHUNK_RECORD_LIMIT, ChunkReader, StagedRecord, insert_chunk};
 use super::codec::{SegmentWriter, encode_hex};
+use super::session_puts::{Put, SessionPuts};
 use super::stage::{
     Staged, open_existing_staging, sealed_records, stage_segments, staged_records, state, state_u64,
 };
@@ -458,7 +459,11 @@ fn build_and_swap(db_path: &Path, verify_open: VerifyOpen<'_>) -> anyhow::Result
     let (tail, (live_kept, live_total)) = {
         let source = open_registry_database_read_only(db_path)?;
         source.busy_timeout(Duration::from_secs(5))?;
-        (sealed_records(&source, state_u64(&staged, "staged_through")?)?, live_records(&source)?)
+        let puts = SessionPuts::load(&staged)?;
+        (
+            sealed_records(&source, state_u64(&staged, "staged_through")?)?,
+            live_records(&source, Some(&puts))?,
+        )
     };
     if let Some(reason) = staged_bytes_refusal(&staged)?.or_else(|| {
         kept_refusal(
@@ -668,8 +673,8 @@ fn build_in(tx: &Transaction<'_>, steps: &mut Steps) -> anyhow::Result<Built> {
         .collect::<Vec<_>>()
         .join(", ");
     steps.mark("copy tables");
-    stage_live_rows(tx)?;
-    check_counts(tx)?;
+    let dropped_puts = stage_live_rows(tx)?;
+    check_counts(tx, dropped_puts)?;
     steps.mark("live rows");
     let (lo, head) = journal_range(tx)?;
     let kept: i64 =
@@ -722,7 +727,8 @@ fn build_in(tx: &Transaction<'_>, steps: &mut Steps) -> anyhow::Result<Built> {
 
     tx.execute_batch(
         "DROP TABLE main.output_cleanup_records; DROP TABLE main.output_cleanup_state;
-         DROP TABLE main.output_cleanup_segments; DROP TABLE main.output_cleanup_chunks;",
+         DROP TABLE main.output_cleanup_segments; DROP TABLE main.output_cleanup_chunks;
+         DROP TABLE main.output_cleanup_session_puts; DROP TABLE main.output_cleanup_held_puts;",
     )?;
     Ok(Built {
         kept: u64::try_from(kept)?,
@@ -835,8 +841,12 @@ fn copy_index_rows(tx: &Transaction<'_>) -> anyhow::Result<()> {
 }
 
 /// The non-output live rows, read through the `(kind, sequence)` index on
-/// both sides of `terminal.output`, in their archived form.
-fn stage_live_rows(tx: &Transaction<'_>) -> anyhow::Result<()> {
+/// both sides of `terminal.output`, in their archived form, but for the
+/// session puts a later live put superseded (`session_puts.rs`). Returns
+/// how many puts it dropped.
+fn stage_live_rows(tx: &Transaction<'_>) -> anyhow::Result<u64> {
+    let puts = SessionPuts::load(tx)?;
+    let mut dropped = 0_u64;
     let actor = if table_columns(tx, "src", "session_journal")?.iter().any(|name| name == "actor") {
         "actor"
     } else {
@@ -861,6 +871,12 @@ fn stage_live_rows(tx: &Transaction<'_>) -> anyhow::Result<()> {
         let stored = stored_record_row(row)?;
         let actor = row.get::<_, Option<String>>(19)?;
         let record = decode_record(stored)?;
+        if Put::from_value(&record.kind, &record.payload)
+            .is_some_and(|put| puts.drops(record.sequence, &put))
+        {
+            dropped += 1;
+            continue;
+        }
         let json = serde_json::to_vec(&journal_record_for_archive(&record))?;
         // A chunk holds one kind (the rows come in (kind, sequence) order,
         // and the pack reads them by sequence: `ChunkReader`) and stays
@@ -878,7 +894,7 @@ fn stage_live_rows(tx: &Transaction<'_>) -> anyhow::Result<()> {
         chunk.push((record.sequence, record.kind, json, actor));
     }
     insert_chunk(tx, &chunk)?;
-    Ok(())
+    Ok(dropped)
 }
 
 /// The first and last sequence the registry's journal covers.
@@ -1188,11 +1204,13 @@ fn has_rowid(tx: &Transaction<'_>, table: &str) -> anyhow::Result<bool> {
     Ok(without == 0)
 }
 
-/// Every source record is either kept or removed output: per staged segment
+/// Every source record is either kept or removed: per staged segment
 /// (Phase A counted them), and for the live rows, whose contiguity and output
-/// count Phase A took in one snapshot. Rows that came after that snapshot are
-/// counted here; they are few.
-fn check_counts(tx: &Transaction<'_>) -> anyhow::Result<()> {
+/// count Phase A took in one snapshot, and `dropped_puts`, the superseded
+/// live puts (all at or before that snapshot's head: the bound of
+/// `session_puts.rs` is older). Rows that came after that snapshot are
+/// counted here; they are few, and all are kept or output.
+fn check_counts(tx: &Transaction<'_>, dropped_puts: u64) -> anyhow::Result<()> {
     let value = |key: &str| -> anyhow::Result<i64> {
         Ok(tx
             .query_row(
@@ -1262,6 +1280,11 @@ fn check_counts(tx: &Transaction<'_>) -> anyhow::Result<()> {
         "the sealed journal is shorter than when it was staged"
     );
     let range_end = live_head.max(archive_end);
+    let dropped_puts = i64::try_from(dropped_puts)?;
+    anyhow::ensure!(
+        dropped_puts == 0 || live_head > archive_end,
+        "superseded live puts were dropped after the staged snapshot"
+    );
     if live_head > archive_end {
         let output = if archive_end == live_archive_end {
             value("live_output")?
@@ -1275,7 +1298,7 @@ fn check_counts(tx: &Transaction<'_>) -> anyhow::Result<()> {
             )?
         };
         anyhow::ensure!(
-            kept_in(archive_end, live_head)? + output == live_head - archive_end,
+            kept_in(archive_end, live_head)? + output + dropped_puts == live_head - archive_end,
             "kept and removed live rows do not add up to the live journal"
         );
     }
