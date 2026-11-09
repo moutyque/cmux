@@ -144,16 +144,16 @@ extension DaemonLauncher {
         }, accepted: { $0 == decision })
     }
 
-    /// `server premigrate-registry` of the bundled binary on this launcher's session: read-only
-    /// beside the running daemon, at most 10 minutes (a partial fold still helps). A failure is
+    /// Thin call site: `server premigrate-registry` of the bundled binary on this launcher's
+    /// session decides what to fold and for how long (cmux-tui `cli/lifecycle.rs`). A failure is
     /// logged and left to the new daemon's start.
     private func premigrateRegistry(logger: Logger) async {
         do {
             let result = try await ProcessRunner.run(
                 executable: configuration.binary,
-                arguments: ["--session", configuration.session, "--json", "server", "premigrate-registry",
-                            "--max-seconds", "600"],
-                environment: await ensureEnvironment(), timeout: .seconds(660), clock: clock)
+                arguments: ["--session", configuration.session, "--json", "server", "premigrate-registry"],
+                // Only a backstop past the command's own bound.
+                environment: await ensureEnvironment(), timeout: .seconds(900), clock: clock)
             logger.info("registry premigrate exit \(result.status): \(String(decoding: result.stdout, as: UTF8.self), privacy: .public)")
         } catch {
             logger.error("registry premigrate failed: \(String(describing: error), privacy: .public)")
