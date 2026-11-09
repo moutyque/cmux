@@ -185,6 +185,46 @@ mod followups {
     }
 
     #[test]
+    fn a_cleanup_refused_after_staging_is_not_staged_again_until_the_journal_doubles() {
+        // Staging finishes and passes the staged size bound: refused. The
+        // same journal would be staged and refused at every start.
+        let dir = temp_dir("refusal-memo");
+        let db_path = registry(&dir, 100, 1);
+        STAGED_BYTES_LIMIT.with(|limit| limit.set(4096));
+        // SAFETY: as in the test above.
+        unsafe { std::env::set_var("CMUX_TUI_TEST_OUTPUT_CLEANUP_MARGIN_BYTES", "0") };
+        let first = stage_registry(&db_path, &control()).unwrap();
+        let StageOutcome::Skipped(reason) = first else { panic!("not refused: {first:?}") };
+        assert!(reason.contains("staging file"), "{reason}");
+        assert!(refused_path(&db_path).is_file(), "the refusal is not recorded");
+
+        // The next start does not stage the same journal again.
+        let second = stage_registry(&db_path, &control()).unwrap();
+        let StageOutcome::Skipped(reason) = second else { panic!("staged again: {second:?}") };
+        assert!(reason.contains("runs again once the journal reaches 202"), "{reason}");
+        assert!(!staging_path(&db_path).exists(), "a staging file was made");
+
+        // Once the journal doubled, it stages (and is refused) again.
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 102 UNION ALL SELECT i + 1 FROM n WHERE i < 202)
+                 INSERT INTO session_journal(sequence, kind) SELECT i, 'terminal.output' FROM n",
+                [],
+            )
+            .unwrap();
+        let third = stage_registry(&db_path, &control()).unwrap();
+        let StageOutcome::Skipped(reason) = third else { panic!("not refused: {third:?}") };
+        assert!(
+            reason.contains("staging file") && !reason.contains("runs again"),
+            "the doubled journal was not staged: {reason}"
+        );
+        let memo = fs::read_to_string(refused_path(&db_path)).unwrap();
+        assert!(memo.contains("head 202"), "{memo}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn an_open_abandons_a_cleanup_whose_tail_sealed_after_staging_would_copy_too_much() {
         // Phase A staged nothing; two million records were sealed after it.
         let dir = temp_dir("sealed-tail");

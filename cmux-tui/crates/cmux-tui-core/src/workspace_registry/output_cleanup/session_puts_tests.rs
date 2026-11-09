@@ -10,8 +10,8 @@ use std::sync::Arc;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
-use super::super::stage::{StageControl, StageOutcome, stage_registry};
-use super::super::{DONE_META_KEY, previous_path, staging_path};
+use super::super::stage::{PUT_RECORDS_LIMIT, StageControl, StageOutcome, stage_registry};
+use super::super::{DONE_META_KEY, V1_DONE_META_KEY, previous_path, staging_path};
 use super::*;
 
 /// Flaps the first session only before the seal, so its latest put is in a
@@ -253,6 +253,63 @@ fn flapping_session_puts_compact_to_the_latest_and_the_created_put() {
     assert_eq!(orphaned, 0);
     drop(db);
     drop(registry);
+    mux.shutdown();
+    drop(mux);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_registry_the_v1_cleanup_finished_compacts_its_put_flood_once() {
+    // A registry with no stored output that the version 1 cleanup marked
+    // done ("not-needed"), whose journal is a put flood.
+    let root = temp_root("v1-done");
+    PUT_RECORDS_LIMIT.with(|limit| limit.set(1_000));
+    let db_path = {
+        let mux = open(&root);
+        for round in 0..2_000 {
+            put(&mux, LIVE, round);
+        }
+        seal_all(&mux);
+        for round in 2_000..3_000 {
+            put(&mux, LIVE, round);
+        }
+        let registry = mux.workspace_registry.lock().unwrap();
+        registry
+            .connection
+            .get()
+            .execute("INSERT INTO meta(key, value) VALUES(?1, 'not-needed')", [V1_DONE_META_KEY])
+            .unwrap();
+        let db_path = registry.session_journal_database_path();
+        drop(registry);
+        mux.shutdown();
+        db_path.unwrap()
+    };
+
+    let mux = open(&root);
+    assert!(
+        !mux.workspace_registry.lock().unwrap().output_cleanup_done().unwrap(),
+        "a v1-done registry counts as done for the put compaction"
+    );
+    let outcome = stage_registry(
+        &db_path,
+        &StageControl { on_pending: &|| {}, next_segment: &|| true, stopped: Arc::new(|| false) },
+    )
+    .unwrap();
+    assert!(matches!(outcome, StageOutcome::Complete { .. }), "not staged: {outcome:?}");
+    let before = puts_read(&mux);
+    mux.shutdown();
+    drop(mux);
+
+    let mux = open(&root);
+    assert!(previous_path(&db_path).is_file(), "the registry was not swapped");
+    let last_before = before.keys().next_back().copied().unwrap();
+    let mut after = puts_read(&mux);
+    after.retain(|sequence, _| *sequence <= last_before);
+    assert_eq!(after.len(), 2, "the created and the latest put stay: {after:?}");
+    assert!(after.values().any(|(_, created)| *created));
+    assert!(after.contains_key(&last_before), "the latest put stays");
+    // One-time: the swap recorded version 2, so no later start stages again.
+    assert!(mux.workspace_registry.lock().unwrap().output_cleanup_done().unwrap());
     mux.shutdown();
     drop(mux);
     let _ = std::fs::remove_dir_all(&root);

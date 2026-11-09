@@ -41,7 +41,13 @@
 //! under [`MAX_STAGED_BYTES`]: Phase A checks an estimate before it stages and
 //! the staged count as it goes, Phase B the staged count before it copies
 //! anything. Past a bound the staging file is deleted and the registry stays
-//! as it is; the next start estimates again.
+//! as it is; the next start estimates again. A refusal after staging is
+//! recorded (`.output-cleanup-refused`, with the journal head), and no start
+//! stages again until the journal has doubled.
+//!
+//! The cleanup runs once per registry ([`DONE_META_KEY`], version 2). A
+//! registry the version 1 cleanup finished or found without output runs it
+//! once more when its journal holds enough session puts to compact.
 
 mod chunks;
 mod codec;
@@ -67,7 +73,12 @@ pub(super) use swap::{
 
 /// Registry meta key set once the cleanup is done (or was not needed). The
 /// cleanup is one-time: a registry with this key is never staged again.
-pub(crate) const DONE_META_KEY: &str = "output_cleanup_v1";
+/// Version 2 also drops superseded session puts (`session_puts.rs`), so a
+/// registry the version 1 cleanup finished or found clean runs it once more.
+pub(crate) const DONE_META_KEY: &str = "output_cleanup_v2";
+/// The version 1 key: a swap of that version wrote it (its backup is still
+/// recognized), but it no longer marks the cleanup done.
+pub(crate) const V1_DONE_META_KEY: &str = "output_cleanup_v1";
 const STAGING_SUFFIX: &str = ".output-cleanup";
 const PREVIOUS_SUFFIX: &str = ".pre-output-cleanup";
 /// Written when a swap failed for a reason other than free space; no later
@@ -77,6 +88,10 @@ const FAILED_SUFFIX: &str = ".output-cleanup-failed";
 /// still held open, e.g. on Windows): no open uses the swapped registry
 /// until a later start finishes the rollback.
 const ROLLBACK_PENDING_SUFFIX: &str = ".output-cleanup-rollback";
+/// Written when staging finished and the result passed a bound
+/// (`stage.rs` `refusal_memo`): no start stages again until the journal
+/// has doubled or the staging format changed.
+const REFUSED_SUFFIX: &str = ".output-cleanup-refused";
 /// Free space beyond the staged file that both phases require.
 const DISK_MARGIN_BYTES: u64 = 1 << 30;
 const OUTPUT_KIND: &str = "terminal.output";
@@ -117,6 +132,10 @@ pub(crate) fn failed_path(db_path: &Path) -> PathBuf {
 
 pub(crate) fn rollback_pending_path(db_path: &Path) -> PathBuf {
     sidecar_path(db_path, ROLLBACK_PENDING_SUFFIX)
+}
+
+pub(crate) fn refused_path(db_path: &Path) -> PathBuf {
+    sidecar_path(db_path, REFUSED_SUFFIX)
 }
 
 fn disk_margin() -> u64 {

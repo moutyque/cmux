@@ -23,7 +23,7 @@ use super::session_puts::{
 };
 use super::{
     MAX_KEPT_RECORDS, OUTPUT_KIND, copied_bytes, free_space_refusal, kept_refusal, live_records,
-    remove_staging, staged_bytes_refusal, staging_path,
+    refused_path, remove_if_present, remove_staging, staged_bytes_refusal, staging_path,
 };
 use crate::platform;
 
@@ -32,6 +32,28 @@ use crate::platform;
 /// superseded session puts (`session_puts.rs`): a format 3 file kept them
 /// all, so it is staged again.
 const STAGING_FORMAT: &str = "4";
+/// Session put records (live rows, and every record of a sealed segment
+/// that lists the kind) from which a registry without stored output still
+/// needs the cleanup: superseded puts may be most of its journal.
+const PUT_RECORDS_WORTH_A_CLEANUP: u64 = 100_000;
+
+#[cfg(test)]
+thread_local! {
+    /// [`PUT_RECORDS_WORTH_A_CLEANUP`] for a test on this thread.
+    pub(super) static PUT_RECORDS_LIMIT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(PUT_RECORDS_WORTH_A_CLEANUP) };
+}
+
+#[cfg(test)]
+fn put_records_worth_a_cleanup() -> u64 {
+    PUT_RECORDS_LIMIT.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn put_records_worth_a_cleanup() -> u64 {
+    PUT_RECORDS_WORTH_A_CLEANUP
+}
+
 /// Free space is checked again after this many staged segments.
 const SEGMENTS_PER_SPACE_CHECK: u64 = 256;
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -49,7 +71,8 @@ fn progress_log_interval() -> Duration {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StageOutcome {
-    /// No stored terminal output: nothing to clean up.
+    /// No stored terminal output and too few session puts to matter:
+    /// nothing to clean up.
     NotNeeded,
     /// Every sealed segment is staged; the next owner start swaps.
     Complete { segments: u64, kept: u64 },
@@ -106,7 +129,10 @@ fn stage_registry_until_stopped(
         .with_context(|| format!("open workspace registry {}", db_path.display()))?;
     source.busy_timeout(Duration::from_secs(5))?;
     stop_reads_on(&source, control.stopped.clone())?;
-    if !output_present(&source)? {
+    if let Some(reason) = refusal_memo(db_path, journal_head(&source)?) {
+        return Ok(StageOutcome::Skipped(reason));
+    }
+    if !output_present(&source)? && !session_puts_present(&source)? {
         return Ok(StageOutcome::NotNeeded);
     }
     // A mixed segment counts as output here (the staged count checks it as
@@ -161,6 +187,7 @@ fn stage_registry_until_stopped(
     if let Some(reason) = abandoned {
         drop(staging);
         remove_staging(db_path)?;
+        write_refusal_memo(db_path, journal_head(&source)?, &reason);
         return Ok(StageOutcome::Skipped(reason));
     }
     count_live_rows(&source, &staging)?;
@@ -193,6 +220,75 @@ pub(super) fn output_present(source: &Connection) -> anyhow::Result<bool> {
         [],
         |row| row.get(0),
     )?)
+}
+
+/// At least [`PUT_RECORDS_WORTH_A_CLEANUP`] session put records, counted
+/// from the `(kind, sequence)` index (stopping at the bound) and the
+/// segment kind map (every record of a segment that lists the kind).
+pub(super) fn session_puts_present(source: &Connection) -> anyhow::Result<bool> {
+    let limit = put_records_worth_a_cleanup();
+    let (live, sealed): (i64, i64) = source.query_row(
+        "SELECT (SELECT COUNT(*) FROM (
+                   SELECT 1 FROM session_journal INDEXED BY session_journal_by_kind_sequence
+                   WHERE kind = ?1 LIMIT ?2)),
+                (SELECT COALESCE(SUM(segment.record_count), 0) FROM journal_segments AS segment
+                 WHERE EXISTS (SELECT 1 FROM journal_segment_kinds AS kinds
+                               WHERE kinds.segment_id = segment.segment_id AND kinds.kind = ?1))",
+        params![SESSION_PUT_KIND, i64::try_from(limit)?],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(u64::try_from(live)?.saturating_add(u64::try_from(sealed)?) >= limit)
+}
+
+/// The journal's last sequence, live or sealed (two index seeks).
+fn journal_head(source: &Connection) -> anyhow::Result<u64> {
+    let head: i64 = source.query_row(
+        "SELECT MAX(COALESCE((SELECT MAX(sequence) FROM session_journal), 0),
+                    COALESCE((SELECT MAX(end_sequence) FROM journal_segments), 0))",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(head)?)
+}
+
+/// Records that staging finished and was refused at journal head `head`,
+/// so later starts do not stage the same journal again (each would copy it
+/// all and be refused the same way). Best effort: without the memo the next
+/// start stages again.
+fn write_refusal_memo(db_path: &Path, head: u64, reason: &str) {
+    let memo = format!("format {STAGING_FORMAT}\nhead {head}\n{reason}\n");
+    if let Err(error) = std::fs::write(refused_path(db_path), memo) {
+        eprintln!("cmux-tui: output cleanup: could not record the refusal: {error}");
+    }
+}
+
+/// `Some(reason)` while a refusal memo covers this journal: same staging
+/// format, and the journal head below twice the head it was refused at. A
+/// memo past that (or unreadable) is removed and the cleanup runs again.
+fn refusal_memo(db_path: &Path, head: u64) -> Option<String> {
+    let path = refused_path(db_path);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut lines = text.lines();
+    let format = lines.next().and_then(|line| line.strip_prefix("format "));
+    let refused_at = lines
+        .next()
+        .and_then(|line| line.strip_prefix("head "))
+        .and_then(|n| n.parse::<u64>().ok());
+    let reason = lines.next().unwrap_or_default();
+    if let Some(refused_at) = refused_at
+        && format == Some(STAGING_FORMAT)
+        && head < refused_at.saturating_mul(2)
+    {
+        return Some(format!(
+            "staging was refused at journal head {refused_at} ({reason}); it runs again once \
+             the journal reaches {}",
+            refused_at.saturating_mul(2)
+        ));
+    }
+    if let Err(error) = remove_if_present(&path) {
+        eprintln!("cmux-tui: output cleanup: could not remove {}: {error:#}", path.display());
+    }
+    None
 }
 
 /// The records of the sealed segments after sequence `after`, from their
