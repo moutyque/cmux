@@ -229,6 +229,10 @@ fn parse_server(words: &[String], flags: &mut Flags) -> Result<CommandPlan, Usag
         ["compact-registry"] => super::lifecycle::ServerAction::CompactRegistry {
             state_dir: flags.take("state-dir").map(PathBuf::from),
         },
+        ["premigrate-registry"] => super::lifecycle::ServerAction::PremigrateRegistry {
+            state_dir: flags.take("state-dir").map(PathBuf::from),
+            max_duration: premigrate_max_duration(flags)?,
+        },
         ["start"] => {
             return Err(UsageError::new(
                 crate::localization::catalog().local_server.start_options_after_action,
@@ -249,6 +253,7 @@ fn parse_server(words: &[String], flags: &mut Flags) -> Result<CommandPlan, Usag
                         "restart",
                         "reload-config",
                         "compact-registry",
+                        "premigrate-registry",
                     ],
                 ),
             )));
@@ -286,6 +291,23 @@ fn restart_action(flags: &mut Flags) -> Result<super::lifecycle::ServerAction, U
         restore_wait: restore_wait(flags)?,
         force: flags.boolean("force"),
     })
+}
+
+/// `server premigrate-registry --max-seconds <n>`: at most a day; none runs
+/// the fold to its end.
+fn premigrate_max_duration(
+    flags: &mut Flags,
+) -> Result<Option<std::time::Duration>, UsageError> {
+    const MAX_SECONDS: u64 = 86_400;
+    match flags.take("max-seconds") {
+        None => Ok(None),
+        Some(value) => match value.parse::<u64>() {
+            Ok(seconds @ 1..=MAX_SECONDS) => Ok(Some(std::time::Duration::from_secs(seconds))),
+            _ => Err(UsageError::new(
+                crate::localization::catalog().local_server.registry_premigrate_max_seconds_invalid,
+            )),
+        },
+    }
 }
 
 fn restore_wait(flags: &mut Flags) -> Result<std::time::Duration, UsageError> {

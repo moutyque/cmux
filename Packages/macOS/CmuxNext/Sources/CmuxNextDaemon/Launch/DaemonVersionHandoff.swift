@@ -123,6 +123,9 @@ extension DaemonLauncher {
         }
         let logger = Logger(subsystem: "com.cmuxterm.next", category: "daemon")
         logger.info("daemon \(identity.pid) runs build \(running, privacy: .public); handing off to \(target, privacy: .public)")
+        // The bundled build folds what its first start would (a new agent roster version) while
+        // this daemon still serves, so that start does not.
+        await premigrateRegistry(logger: logger)
         // Quiet (DaemonConnection.quietHandoff): no request of this connection is cut.
         let handoff = handoff
         return await connection.quietHandoff({ () async -> DaemonVersionDecision in
@@ -139,6 +142,22 @@ extension DaemonLauncher {
             }
             return decision
         }, accepted: { $0 == decision })
+    }
+
+    /// `server premigrate-registry` of the bundled binary on this launcher's session: read-only
+    /// beside the running daemon, at most 10 minutes (a partial fold still helps). A failure is
+    /// logged and left to the new daemon's start.
+    private func premigrateRegistry(logger: Logger) async {
+        do {
+            let result = try await ProcessRunner.run(
+                executable: configuration.binary,
+                arguments: ["--session", configuration.session, "--json", "server", "premigrate-registry",
+                            "--max-seconds", "600"],
+                environment: await ensureEnvironment(), timeout: .seconds(660), clock: clock)
+            logger.info("registry premigrate exit \(result.status): \(String(decoding: result.stdout, as: UTF8.self), privacy: .public)")
+        } catch {
+            logger.error("registry premigrate failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// The running owner lacks `capability`, which the bundled build serves (an older build, or a

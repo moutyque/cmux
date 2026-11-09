@@ -49,6 +49,7 @@ pub(crate) mod mutation_ledger_retention;
 mod open_guard;
 pub(crate) mod output_cleanup;
 pub(crate) mod personal_bookmarks;
+pub(crate) mod premigrate;
 mod personal_browser_profiles;
 pub(crate) mod personal_mutations;
 mod personal_session_icon;
@@ -2595,7 +2596,7 @@ impl WorkspaceRegistry {
             };
         #[cfg(not(debug_assertions))]
         let first = open_once(&mut session_guard, &mut lease);
-        match first {
+        let registry = match first {
             Ok(mut registry) => {
                 // Also true on a later start when the swap start never got
                 // through a full start (killed during restore).
@@ -2612,7 +2613,10 @@ impl WorkspaceRegistry {
                 open_once(&mut session_guard, &mut lease)
             }
             Err(error) => Err(error),
-        }
+        }?;
+        // A roster the next build folded beside the previous owner.
+        premigrate::adopt(&registry);
+        Ok(registry)
     }
 
     /// Opens the registry and builds the owner from it with `load`. When this

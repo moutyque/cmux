@@ -1426,7 +1426,7 @@ pub(crate) fn query_session_journal_after(
     Ok(SessionJournalPage { head_sequence, records })
 }
 
-fn query_session_journal_without_output_after(
+pub(super) fn query_session_journal_without_output_after(
     connection: &Connection,
     sequence: u64,
     through: u64,
