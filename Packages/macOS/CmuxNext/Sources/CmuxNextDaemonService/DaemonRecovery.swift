@@ -45,6 +45,9 @@ public final class DaemonRecovery {
     /// `waitedMs` counted from the first report of this restore: a later ensure on the same owner reports
     /// from its own start, and the time shown never steps back. Nil once an ensure ends.
     public private(set) var restoring: RestoreProgressReport?
+    /// ``restoring`` is set: changes only when a restore starts or ends, not at each progress line, so the sidebar's rows
+    /// (stale while it restores) and the startup deadline (it waits a restore out) follow it without a redraw per line.
+    public private(set) var isRestoring = false
     /// ``restoring`` in the person's words ("Restoring sessions… 4m 12s"); nil while none.
     public var restoringText: String? { restoring.map { RefusalStrings.restoringSessions(waitedMs: $0.waitedMs) } }
     /// When the restore ``restoring`` reports began, and its owner; nil after a start that worked.
@@ -120,6 +123,7 @@ public final class DaemonRecovery {
 
     /// The running ensure's restore progress changed (nil: it ended).
     func noteRestoring(_ report: RestoreProgressReport?) {
+        if isRestoring != (report != nil) { isRestoring = report != nil }
         guard var report else {
             if restoring != nil { restoring = nil }
             return

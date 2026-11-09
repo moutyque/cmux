@@ -13,7 +13,8 @@ import CmuxNextWakeups
 /// or after ``PendingOpenPatience/limit`` (one ``DemandTimer`` deadline). The watch ends with the open.
 @MainActor
 public final class PendingSessionOpen {
-    private let daemon: DaemonService
+    /// Whether this Mac's sessions take an open now, read through Observation (``ready(_:)``).
+    private let isReady: @MainActor @Sendable () -> Bool
     /// The window an open is clicked in now (nil: none), and the windows still open.
     private let activeWindow: @MainActor () -> AnyObject?
     private let openWindows: @MainActor () -> [AnyObject]
@@ -28,10 +29,16 @@ public final class PendingSessionOpen {
     /// Now, for the slot's patience (tests move it).
     var now: () -> ContinuousClock.Instant = { ContinuousClock.now }
 
-    public init(daemon: DaemonService, activeWindow: @escaping @MainActor () -> AnyObject?,
-                openWindows: @escaping @MainActor () -> [AnyObject], show: @escaping @MainActor (String) -> Void,
-                clock: any Clock<Duration> = ContinuousClock()) {
-        self.daemon = daemon
+    public convenience init(daemon: DaemonService, activeWindow: @escaping @MainActor () -> AnyObject?,
+                            openWindows: @escaping @MainActor () -> [AnyObject], show: @escaping @MainActor (String) -> Void) {
+        self.init(ready: { Self.ready(daemon) }, activeWindow: activeWindow, openWindows: openWindows, show: show)
+    }
+
+    /// `ready`: whether an open runs now, read through Observation (tests stand in for the daemon).
+    init(ready: @escaping @MainActor @Sendable () -> Bool, activeWindow: @escaping @MainActor () -> AnyObject?,
+         openWindows: @escaping @MainActor () -> [AnyObject], show: @escaping @MainActor (String) -> Void,
+         clock: any Clock<Duration> = ContinuousClock()) {
+        isReady = ready
         self.activeWindow = activeWindow
         self.openWindows = openWindows
         self.show = show
@@ -42,7 +49,9 @@ public final class PendingSessionOpen {
     public var isWaiting: Bool { slot.isWaiting }
 
     /// Whether the local daemon takes an open now: connected, its mirror loaded.
-    var ready: Bool { daemon.isLive && daemon.store.isLoaded }
+    static func ready(_ daemon: DaemonService) -> Bool { daemon.isLive && daemon.store.isLoaded }
+
+    private var ready: Bool { isReady() }
 
     /// Keeps `open` for later and returns true when the sessions are not ready; false (and nothing kept) when
     /// they are, so the caller opens now.
@@ -57,10 +66,10 @@ public final class PendingSessionOpen {
             _ = self?.advance()
         }
         guard watch == nil else { return true }
-        let daemon = daemon
+        let isReady = isReady
         // task-owner: the opener (app lifetime); ends when the open runs or is dropped (`advance`).
         watch = Task { [weak self] in
-            for await _ in ObservationStream({ daemon.isLive && daemon.store.isLoaded }) {
+            for await _ in ObservationStream({ isReady() }) {
                 guard let self else { return }
                 if advance() { return }
             }

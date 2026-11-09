@@ -12,11 +12,14 @@
 #      reports a restore for 3 s. It checks that the launch window and the
 #      sidebar say "Restoring sessions…" with a growing time, and that the status
 #      clears when the ensure answers. A chat clicked meanwhile waits and opens
-#      once the sessions are ready (PendingOpenSlotTests).
+#      once the sessions are ready (PendingOpenSlotTests). A 5-minute restore, in
+#      injected time, keeps the launch snapshot's workspaces shown (read-only),
+#      never shows a failure, and runs a chat clicked meanwhile once it answers.
 #
 # Each part prints one line:
 #   SELF_HEAL_PROBE web time_to_recover_ms=<n> missed_turns=<n> duplicate_turns=<n>
 #   SELF_HEAL_PROBE app restore_status_shown_after_ms=<n> connected_after_ms=<n>
+#   SELF_HEAL_PROBE app usable_during_restore_ms=<n> snapshot_workspaces=<n> pending_open_ran_after_ms=<n>
 # and the script exits non-zero when a part fails or a line is missing or
 # reports a missed or duplicated turn.
 #
@@ -50,14 +53,15 @@ run_app() {
   fi
   (cd "$root/Packages/macOS/CmuxNext" &&
     swift test --filter 'DaemonRestoreProgressTests|RestoreProgressLinesTests|PendingOpenSlotTests') 2>&1 | tee -a "$log" || status=1
-  grep -q '^SELF_HEAL_PROBE app ' "$log" || { echo "probe: the app part printed no SELF_HEAL_PROBE line" >&2; status=1; }
+  grep -q '^SELF_HEAL_PROBE app restore_status' "$log" || { echo "probe: the app part printed no restore status line" >&2; status=1; }
+  grep -q '^SELF_HEAL_PROBE app usable_during_restore' "$log" || { echo "probe: the app part printed no usable-during-restore line" >&2; status=1; }
 }
 
 case "$part" in
   web) run_web ;;
   app) run_app ;;
   all) run_web; run_app ;;
-  *) sed -n '2,26p' "$0"; exit 2 ;;
+  *) sed -n '2,30p' "$0"; exit 2 ;;
 esac
 echo "--- summary"
 grep '^SELF_HEAL_PROBE ' "$log" || true
