@@ -130,7 +130,7 @@ struct DaemonRestoreProgressTests {
 
     /// Stands in for "connected" in the usable-during-restore probe: the stand-in's socket never answers, so the
     /// ensure's answer is the moment a live daemon would connect.
-    @Observable @MainActor private final class Answered { var value = false }
+    @Observable @MainActor final class Answered { var value = false }
     /// What the held open and its toasts did, read by the test.
     @MainActor private final class Seen { var ranAt: ContinuousClock.Instant?; var toasts: [String] = [] }
 
