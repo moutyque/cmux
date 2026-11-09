@@ -49,11 +49,11 @@ pub(crate) mod mutation_ledger_retention;
 mod open_guard;
 pub(crate) mod output_cleanup;
 pub(crate) mod personal_bookmarks;
-pub(crate) mod premigrate;
 mod personal_browser_profiles;
 pub(crate) mod personal_mutations;
 mod personal_session_icon;
 pub(crate) mod personal_store;
+pub(crate) mod premigrate;
 mod projection_size;
 use projection_size::{
     MAX_PROJECTION_BYTES, MAX_RESOURCE_API_PROJECTION_BYTES, note_projection_size,

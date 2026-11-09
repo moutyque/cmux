@@ -296,9 +296,7 @@ fn restart_action(flags: &mut Flags) -> Result<super::lifecycle::ServerAction, U
 /// `server premigrate-registry --max-seconds <n>`: at most a day, 10 minutes
 /// by default (the app's update handoff waits for it; a partial fold still
 /// shortens the next start, and the next run resumes it).
-fn premigrate_max_duration(
-    flags: &mut Flags,
-) -> Result<Option<std::time::Duration>, UsageError> {
+fn premigrate_max_duration(flags: &mut Flags) -> Result<Option<std::time::Duration>, UsageError> {
     const DEFAULT_SECONDS: u64 = 600;
     const MAX_SECONDS: u64 = 86_400;
     match flags.take("max-seconds") {

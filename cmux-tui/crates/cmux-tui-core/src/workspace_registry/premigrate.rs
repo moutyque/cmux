@@ -145,6 +145,18 @@ pub fn premigrate_registry(
     Ok(PremigrateOutcome::Done(report))
 }
 
+/// The registry file of `session_name` under the state root `root`.
+#[cfg(test)]
+pub(crate) fn registry_file(root: &Path, session_name: &str) -> PathBuf {
+    platform::normalize_filesystem_path(
+        persistent_session_state_dir(
+            &platform::normalize_filesystem_path(root.to_path_buf()),
+            session_name,
+        )
+        .join(WORKSPACE_REGISTRY_FILE),
+    )
+}
+
 /// The side file of the registry at `db_path`.
 pub fn roster_side_file(db_path: &Path) -> PathBuf {
     sidecar_path(db_path, ROSTER_SIDE_FILE_SUFFIX)
@@ -211,14 +223,13 @@ impl SideSnapshot {
             "snapshot": self.snapshot,
         });
         let temporary = sidecar_path(path, ".tmp");
-        let mut file = File::create(&temporary)
-            .with_context(|| format!("create {}", temporary.display()))?;
+        let mut file =
+            File::create(&temporary).with_context(|| format!("create {}", temporary.display()))?;
         platform::restrict_file(&temporary)?;
         file.write_all(value.to_string().as_bytes())?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, path)
-            .with_context(|| format!("replace {}", path.display()))?;
+        fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
         #[cfg(unix)]
         if let Some(directory) = path.parent() {
             File::open(directory)?.sync_all()?;
@@ -247,8 +258,8 @@ fn fold_roster(
     started: Instant,
 ) -> anyhow::Result<RosterPremigration> {
     let side_file = roster_side_file(db_path);
-    let registry_id = meta_value(source, "registry_id")?
-        .context("the workspace registry has no registry_id")?;
+    let registry_id =
+        meta_value(source, "registry_id")?.context("the workspace registry has no registry_id")?;
     let head = query_journal_head(source)?;
     let mut report = RosterPremigration {
         registry: db_path.to_path_buf(),
@@ -383,7 +394,7 @@ fn print_progress(cursor: u64, head: u64) {
 /// snapshot that restores; any other side file is removed. A failed write
 /// keeps the file for the next start.
 pub(crate) fn adopt(registry: &WorkspaceRegistry) {
-    let Some(db_path) = registry.database_path() else { return };
+    let Some(db_path) = registry.database_path.as_deref() else { return };
     let side_file = roster_side_file(db_path);
     if !side_file.exists() {
         return;

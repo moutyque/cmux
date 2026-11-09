@@ -6,7 +6,7 @@ use super::*;
 use crate::journal_reducers::{AGENT_ROSTER_REDUCER_ID, AGENT_ROSTER_REDUCER_VERSION};
 use crate::mux::agent_roster_restore::{RosterFoldLimits, restore_agent_roster_with};
 use crate::workspace_registry::premigrate::{
-    PremigrateControl, PremigrateOutcome, RosterPremigration, premigrate_registry,
+    PremigrateControl, PremigrateOutcome, RosterPremigration, premigrate_registry, registry_file,
     roster_side_file,
 };
 use serde_json::Value;
@@ -66,7 +66,8 @@ fn stale_roster_store(session: &'static str) -> Store {
     mux.shutdown();
     drop(mux);
     let registry = WorkspaceRegistry::open(&root, session).unwrap();
-    let db_path = registry.database_path().unwrap().to_path_buf();
+    let db_path = registry_file(&root, session);
+    assert!(db_path.is_file(), "{}", db_path.display());
     let head = registry.session_journal_head().unwrap();
     registry.put_journal_reducer_state(AGENT_ROSTER_REDUCER_ID, 0, 0, "").unwrap();
     let limits = RosterFoldLimits { page: 512, save_every_pages: 64, stop_after_pages: None };
@@ -157,7 +158,10 @@ fn a_partial_premigration_resumes_from_its_side_file() {
     // A stop request saves where the fold was and exits cleanly.
     std::fs::remove_file(roster_side_file(&store.db_path)).unwrap();
     let stopped = premigrate(&store, &PremigrateControl::new(None, &|| true));
-    assert_eq!((stopped.cursor, stopped.complete, stopped.stop_reason), (0, false, Some("stopped")));
+    assert_eq!(
+        (stopped.cursor, stopped.complete, stopped.stop_reason),
+        (0, false, Some("stopped"))
+    );
 }
 
 #[test]
@@ -172,9 +176,11 @@ fn an_up_to_date_roster_or_a_missing_registry_has_nothing_to_premigrate() {
     assert!(report.up_to_date && report.complete && report.records_folded == 0, "{report:?}");
     assert!(!roster_side_file(&store.db_path).exists());
     assert!(matches!(
-        premigrate_registry(&store.root, "premigrate-no-such-session", &PremigrateControl::new(
-            None, NEVER
-        ))
+        premigrate_registry(
+            &store.root,
+            "premigrate-no-such-session",
+            &PremigrateControl::new(None, NEVER)
+        )
         .unwrap(),
         PremigrateOutcome::NoRegistry(_)
     ));
