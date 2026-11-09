@@ -126,6 +126,9 @@ impl Put {
     }
 }
 
+/// Session id to (its latest put, whether that put may be dropped).
+type LatestPuts = HashMap<String, (u64, bool)>;
+
 /// Reads the live puts once, before any segment is staged, in one read
 /// snapshot of `source`: each session's latest put and how many live puts
 /// stay. Done once per staging file.
@@ -134,7 +137,7 @@ pub(super) fn record_live_puts(source: &Connection, staging: &Connection) -> any
         return Ok(());
     }
     source.execute_batch("BEGIN DEFERRED")?;
-    let read = (|| -> anyhow::Result<(i64, i64, HashMap<String, (u64, bool)>, u64)> {
+    let read = (|| -> anyhow::Result<(i64, i64, LatestPuts, u64)> {
         let archive_end: i64 = source.query_row(
             "SELECT COALESCE(MAX(end_sequence), 0) FROM journal_segments",
             [],
@@ -145,9 +148,7 @@ pub(super) fn record_live_puts(source: &Connection, staging: &Connection) -> any
             [archive_end],
             |row| row.get(0),
         )?;
-        // Session id to (latest put, whether that put may be dropped), and
-        // the puts dropped so far.
-        let mut latest: HashMap<String, (u64, bool)> = HashMap::new();
+        let mut latest = LatestPuts::new();
         let mut puts = 0_u64;
         let mut dropped = 0_u64;
         let mut statement = source.prepare(

@@ -308,7 +308,7 @@ fn a_segment_split_holds_the_latest_put_and_drops_the_superseded_ones() {
     // a's created put stays, its other one is dropped (a later live put);
     // b's created put stays and its latest so far is held.
     assert_eq!(sequences(&first.staged), vec![1, 3, 4]);
-    assert_eq!((first.held, first.superseded.clone()), (1, Vec::new()));
+    assert_eq!((first.held, first.superseded), (1, Vec::new()));
     let second = puts.split_segment(vec![record(7, "b", false), record(8, "c", false)], 7);
     assert_eq!(sequences(&second.staged), Vec::<u64>::new());
     assert_eq!(second.held, 2, "b's and c's latest are held here");
